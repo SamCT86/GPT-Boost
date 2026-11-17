@@ -9,7 +9,7 @@ GPT Boost reduces lag on long ChatGPT conversations by **lazy-loading**: it show
 - Optional auto-reveal when you scroll to the top.
 - Optional trimming of the oldest visible message when new ones arrive.
 - Simple, non-intrusive UI; per-site content script (no background service worker).
-- Works on conversation URLs like `https://chatgpt.com/share/*` and `https://chatgpt.com/c/*`.
+- Works on shared, standalone and project conversation URLs.
 
 ## Install (Chrome Web Store)
 
@@ -100,8 +100,8 @@ If you want to help with translations, please create a pull request with the new
 
 ## Notes
 
-- GPT Boost hides older DOM nodes (`display: none`) to reduce layout/paint cost. It does **not** modify or exfiltrate content.
-- The ChatGPT DOM evolves. The extension attempts to detect messages via several robust selectors and re-applies windowing as the page updates.
+- The default mode hides older message elements with a reversible CSS class. Revealing them restores the page's own layout styles.
+- The extension recalculates message visibility when messages are added or removed, the conversation changes or settings are updated. Streaming updates inside an existing message leave the message list alone.
 - You can always collapse back to the threshold using the **Collapse** button in the pill.
 
 ## Privacy

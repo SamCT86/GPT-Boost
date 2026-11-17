@@ -22,20 +22,18 @@ import { getMessage } from './i18n';
 
   let settings = { ...DEFAULTS };
 
-  // Unified state model
-  let state = {
+  const state = {
     firstVisible: 0, // index of first visible message (0 = show all)
     prunedCount: 0, // messages permanently removed (delete mode)
-    lastTotal: 0, // last known total for change detection
   };
 
   // DOM references
   let container = null;
-  let threadContainer = null;
-  let mainObserver = null;
-  let topSentinel = null;
-  let sentinelObserver = null;
+  let messages = [];
+  let placeholder = null;
+  let placeholderObserver = null;
   let uiBar = null;
+  let resetLimit = false;
 
   // ─────────────────────────────────────────────────────────────────
   // Settings
@@ -59,10 +57,10 @@ import { getMessage } from './i18n';
     try {
       chrome.storage.onChanged.addListener((changes, area) => {
         if (area !== 'sync') return;
-        for (const k of Object.keys(DEFAULTS)) {
-          if (k in changes) settings[k] = changes[k].newValue;
-        }
-        syncUIState();
+        const changedKeys = Object.keys(DEFAULTS).filter((key) => key in changes);
+        if (!changedKeys.length) return;
+        for (const key of changedKeys) settings[key] = changes[key].newValue ?? DEFAULTS[key];
+        resetLimit ||= changedKeys.includes('maxVisible');
         scheduleApply('settings changed');
       });
     } catch (_) {
@@ -73,164 +71,124 @@ import { getMessage } from './i18n';
   // ─────────────────────────────────────────────────────────────────
   // Selectors
   // ─────────────────────────────────────────────────────────────────
-  const CONTAINER_SELECTORS = [
-    'main div[data-testid="conversation"]',
-    'main div[data-tab="conversation"]',
-    'main div:has(> div[data-testid^="conversation-turn"])',
-    'main div.flex.flex-col:has([data-message-author-role])',
-    'main[role="main"]',
-    'main',
-  ];
-
-  const MESSAGE_SELECTORS = [
+  const MESSAGE_SELECTOR = [
     '[data-testid^="conversation-turn"]',
-    '[data-message-author-role]',
-    'article[data-message-author-role]',
+    '[data-content-search-unit-key$=":user"]',
+    '[data-content-search-unit-key$=":assistant"]',
+    '[data-turn="user"]',
+    '[data-turn="assistant"]',
+    '[data-message-author-role="user"]',
+    '[data-message-author-role="assistant"]',
     'div[data-message-id]',
     'div[data-testid="message"]',
-  ];
+  ].join(',');
+  const USER_BUBBLE_SELECTOR = '[data-user-message-bubble], [data-message-author-role="user"]';
+  const HIDDEN_CLASS = 'gpt-boost-turn-hidden';
+  const measuredHeights = new WeakMap();
+  const heightNodes = new Set();
+  const prunedNodes = new WeakSet();
 
   function findContainer() {
-    for (const sel of CONTAINER_SELECTORS) {
-      const node = document.querySelector(sel);
-      if (node) return node;
-    }
-    return document.querySelector('main') || document.body;
-  }
-
-  function findThreadContainer() {
-    return document.getElementsByClassName('thread-xl:pt-header-height')[0] || null;
-  }
-
-  function isOnChatPage() {
-    return !!document.querySelector('textarea, [data-testid="composer"], [data-testid="send-button"]');
+    return document.querySelector('main, [role="main"]');
   }
 
   function collectMessages() {
-    const nodes = new Set();
-    MESSAGE_SELECTORS.forEach((sel) => {
-      document.querySelectorAll(sel).forEach((n) => nodes.add(n));
+    return [...container.querySelectorAll(MESSAGE_SELECTOR)].filter((node) => {
+      const ancestor = node.parentElement?.closest(MESSAGE_SELECTOR);
+      return !ancestor || !container.contains(ancestor);
     });
-    let arr = [...nodes].filter((n) => !container || container.contains(n));
-    // Remove nested duplicates
-    const set = new Set(arr);
-    arr = arr.filter((n) => {
-      let p = n.parentElement;
-      while (p && p !== container && p !== document.body) {
-        if (set.has(p)) return false;
-        p = p.parentElement;
-      }
-      return true;
-    });
-    arr.sort((a, b) => (a.compareDocumentPosition(b) & Node.DOCUMENT_POSITION_FOLLOWING ? -1 : 1));
-    return arr;
   }
 
   // ─────────────────────────────────────────────────────────────────
-  // Strategy: Hide vs Delete
+  // Hide and restore only styles owned by this extension
   // ─────────────────────────────────────────────────────────────────
-  const strategies = {
-    hide: {
-      apply(messages, firstVisible) {
-        messages.forEach((node, idx) => {
-          node.style.display = idx < firstVisible ? 'none' : '';
-        });
-      },
-      reveal(messages, currentFirst, batchSize) {
-        return Math.max(0, currentFirst - batchSize);
-      },
-      getHiddenCount(firstVisible) {
-        return firstVisible;
-      },
-    },
-    delete: {
-      apply(messages, firstVisible, buffer) {
-        const pruneCount = Math.max(0, firstVisible - buffer);
-        for (let i = 0; i < pruneCount; i++) {
-          if (messages[i]?.isConnected) {
-            messages[i].remove();
-            state.prunedCount++;
-          }
-        }
-        for (let i = pruneCount; i < firstVisible; i++) {
-          if (messages[i]?.isConnected) messages[i].style.display = 'none';
-        }
-        for (let i = firstVisible; i < messages.length; i++) {
-          if (messages[i]?.isConnected) messages[i].style.display = '';
-        }
-      },
-      reveal(messages, currentFirst, batchSize, buffer) {
-        const pruneCount = Math.max(0, currentFirst - buffer);
-        if (pruneCount >= currentFirst) return currentFirst;
-        return Math.max(pruneCount, currentFirst - batchSize);
-      },
-      getHiddenCount(firstVisible, buffer) {
-        return Math.min(firstVisible, buffer);
-      },
-    },
-  };
-
-  function getStrategy() {
-    return settings.deleteMessages ? strategies.delete : strategies.hide;
+  function setHidden(node, hidden) {
+    if (node.classList.contains(HIDDEN_CLASS) !== hidden) node.classList.toggle(HIDDEN_CLASS, hidden);
   }
 
   // ─────────────────────────────────────────────────────────────────
   // Message Height Limiting
   // ─────────────────────────────────────────────────────────────────
-  function applyHeightLimit(node) {
-    if (node.dataset.gptBoostHeight) return; // already processed
-    if (node.dataset.messageAuthorRole !== 'user') return; // only user messages
-    node.dataset.gptBoostHeight = '1';
-
-    // Check if content exceeds threshold
-    if (node.scrollHeight > settings.userMessageMaxHeight) {
-      node.classList.add('gpt-boost-collapsed');
-
-      node.addEventListener('click', (e) => {
-        // Do not toggle if user is selecting text
-        if (window.getSelection().toString().length > 0) return;
-        // Do not toggle if clicking a link or button
-        if (e.target.closest('a, button')) return;
-
-        if (node.classList.contains('gpt-boost-collapsed')) {
-          node.classList.remove('gpt-boost-collapsed');
-          node.classList.add('gpt-boost-expanded');
-        } else {
-          node.classList.remove('gpt-boost-expanded');
-          node.classList.add('gpt-boost-collapsed');
-        }
-      });
+  function applyHeightLimits() {
+    const limit = Math.max(1, settings.userMessageMaxHeight);
+    const measured = [];
+    for (let index = state.firstVisible; index < messages.length; index++) {
+      const message = messages[index];
+      const bubble = message.matches(USER_BUBBLE_SELECTOR) ? message : message.querySelector(USER_BUBBLE_SELECTOR);
+      if (!bubble || measuredHeights.get(bubble) === limit || !bubble.getClientRects().length) continue;
+      measured.push({ bubble, collapse: bubble.scrollHeight > limit });
+    }
+    for (const { bubble, collapse } of measured) {
+      measuredHeights.set(bubble, limit);
+      if (collapse) {
+        heightNodes.add(bubble);
+        bubble.style.setProperty('--gpt-boost-message-max-height', limit + 'px');
+        if (!bubble.classList.contains('gpt-boost-expanded')) bubble.classList.add('gpt-boost-collapsed');
+      } else {
+        clearHeightLimit(bubble);
+      }
     }
   }
 
-  function applyHeightLimits() {
-    document.querySelectorAll('[data-message-author-role="user"]').forEach(applyHeightLimit);
+  function clearHeightLimit(node) {
+    if (!heightNodes.delete(node)) return;
+    node.classList.remove('gpt-boost-collapsed', 'gpt-boost-expanded');
+    node.style.removeProperty('--gpt-boost-message-max-height');
+  }
+
+  function onMessageClick(event) {
+    const target = event.target;
+    if (
+      !(target instanceof Element) ||
+      target.closest('a, button, input, textarea, [contenteditable="true"]') ||
+      window.getSelection()?.toString()
+    )
+      return;
+    const bubble = target.closest('.gpt-boost-collapsed, .gpt-boost-expanded');
+    if (!bubble || !heightNodes.has(bubble)) return;
+    const expand = bubble.classList.contains('gpt-boost-collapsed');
+    bubble.classList.toggle('gpt-boost-collapsed', !expand);
+    bubble.classList.toggle('gpt-boost-expanded', expand);
   }
 
   // ─────────────────────────────────────────────────────────────────
   // Placeholder
   // ─────────────────────────────────────────────────────────────────
-  function renderPlaceholder(messages, hiddenCount) {
-    let el = container?.querySelector('.gpt-boost-hidden-placeholder');
-    if (hiddenCount > 0 && !settings.deleteMessages) {
-      if (!el) {
-        el = document.createElement('div');
-        el.className = 'gpt-boost-hidden-placeholder';
-        el.isGptBoost = true;
-        el.addEventListener('click', revealOlder);
-      }
-      el.textContent =
-        hiddenCount === 1
-          ? getMessage('hiddenPlaceholderSingular', [String(settings.batchSize)])
-          : getMessage('hiddenPlaceholderPlural', [String(hiddenCount), String(settings.batchSize)]);
-      const anchor = messages[state.firstVisible];
-      if (anchor?.parentNode) {
-        anchor.before(el);
-      } else if (container) {
-        container.appendChild(el);
-      }
-    } else {
-      el?.remove();
+  function clearPlaceholder() {
+    placeholderObserver?.disconnect();
+    placeholderObserver = null;
+    placeholder?.remove();
+    placeholder = null;
+  }
+
+  function renderPlaceholder() {
+    const hiddenCount = state.firstVisible;
+    const anchor = messages[hiddenCount];
+    if (!hiddenCount || !anchor?.isConnected || settings.deleteMessages) {
+      clearPlaceholder();
+      return;
+    }
+    if (!placeholder) {
+      placeholder = document.createElement('button');
+      placeholder.type = 'button';
+      placeholder.className = 'gpt-boost-hidden-placeholder';
+      placeholder.isGptBoost = true;
+      placeholder.addEventListener('click', revealOlder);
+    }
+    const label =
+      hiddenCount === 1
+        ? getMessage('hiddenPlaceholderSingular', [String(settings.batchSize)])
+        : getMessage('hiddenPlaceholderPlural', [String(hiddenCount), String(settings.batchSize)]);
+    if (placeholder.textContent !== label) placeholder.textContent = label;
+    if (anchor.previousSibling !== placeholder) anchor.before(placeholder);
+    if (settings.autoloadOnScroll && !placeholderObserver) {
+      placeholderObserver = new IntersectionObserver((entries) => {
+        if (entries.some((entry) => entry.isIntersecting && entry.target === placeholder)) revealOlder();
+      });
+      placeholderObserver.observe(placeholder);
+    } else if (!settings.autoloadOnScroll && placeholderObserver) {
+      placeholderObserver.disconnect();
+      placeholderObserver = null;
     }
   }
 
@@ -238,12 +196,6 @@ import { getMessage } from './i18n';
   // UI Bar
   // ─────────────────────────────────────────────────────────────────
   function ensureUI() {
-    if (!/\/(share|c)\//.test(location.pathname)) {
-      uiBar?.remove();
-      uiBar = null;
-      return;
-    }
-
     if (!uiBar) {
       uiBar = document.createElement('div');
       uiBar.isGptBoost = true;
@@ -270,20 +222,6 @@ import { getMessage } from './i18n';
       setupDrag(pill);
     } else if (!uiBar.isConnected) {
       document.body.appendChild(uiBar);
-    }
-
-    // Top sentinel for auto-load
-    if (threadContainer && !topSentinel && settings.autoloadOnScroll && !settings.deleteMessages) {
-      topSentinel = document.createElement('div');
-      topSentinel.className = 'gpt-boost-sentinel';
-      topSentinel.isGptBoost = true;
-      threadContainer.prepend(topSentinel);
-      sentinelObserver = new IntersectionObserver((entries) => {
-        for (const e of entries) {
-          if (e.isIntersecting && state.firstVisible > 0) revealOlder();
-        }
-      });
-      sentinelObserver.observe(topSentinel);
     }
   }
 
@@ -340,118 +278,117 @@ import { getMessage } from './i18n';
   }
 
   function updateStatus(total, visible) {
-    const el = document.getElementById('gpt-boost-status');
+    const el = uiBar?.querySelector('#gpt-boost-status');
     if (!el) return;
-    if (settings.deleteMessages) {
-      const trueTotal = total + state.prunedCount;
-      el.textContent = getMessage('statusBarDeleteMode', [
-        String(visible),
-        String(settings.hiddenDomBuffer),
-        String(trueTotal),
-      ]);
-    } else {
-      el.textContent = getMessage('statusBar', [String(visible), String(total)]);
-    }
+    const label = settings.deleteMessages
+      ? getMessage('statusBarDeleteMode', [
+          String(visible),
+          String(state.firstVisible),
+          String(total + state.prunedCount),
+        ])
+      : getMessage('statusBar', [String(visible), String(total)]);
+    if (el.textContent !== label) el.textContent = label;
   }
 
   function syncUIState() {
-    const showBtn = document.getElementById('gpt-boost-show-older');
-    const reloadBtn = document.getElementById('gpt-boost-reload');
-    if (settings.deleteMessages) {
-      if (showBtn) {
-        showBtn.disabled = true;
-        showBtn.style.opacity = '0.5';
-      }
-      if (reloadBtn) reloadBtn.style.display = 'block';
-    } else {
-      if (showBtn) {
-        showBtn.disabled = false;
-        showBtn.style.opacity = '1';
-      }
-      if (reloadBtn) reloadBtn.style.display = 'none';
-    }
+    const showBtn = uiBar.querySelector('#gpt-boost-show-older');
+    const reloadBtn = uiBar.querySelector('#gpt-boost-reload');
+    showBtn.disabled = state.firstVisible === 0;
+    reloadBtn.style.display = state.prunedCount > 0 ? 'block' : 'none';
   }
 
   // ─────────────────────────────────────────────────────────────────
   // Core windowing
   // ─────────────────────────────────────────────────────────────────
   function applyWindowing() {
-    if (!isOnChatPage()) return;
-    container = container?.isConnected ? container : findContainer();
-    threadContainer = findThreadContainer();
-    ensureUI();
+    handleRouteChange();
+    if (!lastPath) return;
+    const nextContainer = findContainer();
+    if (nextContainer !== container) {
+      resetWindow();
+      container = nextContainer;
+    }
+    if (!container) return;
 
-    const messages = collectMessages();
-    const total = messages.length;
-    if (total === 0) {
-      updateStatus(0, 0);
+    const previous = messages;
+    messages = collectMessages();
+    if (!messages.length) {
+      resetWindow();
       return;
     }
-
-    const threshold = Math.max(1, settings.maxVisible);
-    const buffer = Math.max(0, settings.hiddenDomBuffer);
-
-    const prevTotal = state.lastTotal;
-
-    // On new chat load (total was 0, now > 0), reset
-    if (prevTotal === 0 && total > 0) {
-      state.firstVisible = Math.max(0, total - threshold);
+    ensureUI();
+    const retainedFirst = messages.indexOf(previous[state.firstVisible]);
+    const sameThread = retainedFirst >= 0 || messages.includes(previous.at(-1));
+    const limit = thresholdIndex();
+    if (!sameThread) {
       state.prunedCount = 0;
-    } else if (settings.hideOldestOnNew && total > prevTotal) {
-      state.firstVisible = Math.max(0, total - threshold);
-    } else {
-      state.firstVisible = Math.min(state.firstVisible, Math.max(0, total - threshold));
     }
+    const appended = messages.length > previous.length && messages.at(-1) !== previous.at(-1);
+    state.firstVisible =
+      resetLimit || !sameThread || (settings.hideOldestOnNew && appended)
+        ? limit
+        : Math.min(retainedFirst >= 0 ? retainedFirst : state.firstVisible, limit);
+    resetLimit = false;
+    renderWindow();
+  }
 
-    state.lastTotal = total;
-    const strategy = getStrategy();
-
+  function renderWindow() {
     if (settings.deleteMessages) {
-      strategy.apply(messages, state.firstVisible, buffer);
-    } else {
-      strategy.apply(messages, state.firstVisible);
+      const count = Math.max(0, state.firstVisible - Math.max(0, settings.hiddenDomBuffer));
+      const removed = messages.splice(0, count);
+      for (const node of removed) {
+        prunedNodes.add(node);
+        node.remove();
+      }
+      state.prunedCount += removed.length;
+      state.firstVisible -= removed.length;
     }
+    messages.forEach((node, index) => setHidden(node, index < state.firstVisible));
+    for (const node of heightNodes) {
+      if (!container.contains(node)) clearHeightLimit(node);
+    }
+    refreshWindowControls();
+  }
 
-    const visible = total - state.firstVisible;
-    updateStatus(total, visible);
-
-    const hiddenCount = strategy.getHiddenCount(state.firstVisible, buffer);
-    renderPlaceholder(messages, hiddenCount);
-
-    // Apply height limits to user messages
+  function refreshWindowControls() {
     applyHeightLimits();
-
-    log('applyWindowing:', { total, firstVisible: state.firstVisible, visible });
+    renderPlaceholder();
+    updateStatus(messages.length, messages.length - state.firstVisible);
+    syncUIState();
   }
 
   function revealOlder() {
-    log('revealOlder: start');
-    const messages = collectMessages();
-    if (!messages.length || state.firstVisible === 0) return;
-
-    const batchSize = Math.max(1, settings.batchSize);
-    const buffer = Math.max(0, settings.hiddenDomBuffer);
-    const strategy = getStrategy();
-
-    const newFirst = strategy.reveal(messages, state.firstVisible, batchSize, buffer);
+    if (!state.firstVisible || !messages[state.firstVisible]?.isConnected) return;
+    const newFirst = Math.max(0, state.firstVisible - Math.max(1, settings.batchSize));
     for (let i = newFirst; i < state.firstVisible; i++) {
-      if (messages[i]?.isConnected) messages[i].style.display = '';
+      setHidden(messages[i], false);
     }
     state.firstVisible = newFirst;
-
-    const hiddenCount = strategy.getHiddenCount(state.firstVisible, buffer);
-    renderPlaceholder(messages, hiddenCount);
-    updateStatus(messages.length, messages.length - state.firstVisible);
-    log('revealOlder:', { firstVisible: state.firstVisible });
+    refreshWindowControls();
   }
 
   function collapseToThreshold() {
-    const messages = collectMessages();
     if (!messages.length) return;
-    const threshold = Math.max(1, settings.maxVisible);
-    state.firstVisible = Math.max(0, messages.length - threshold);
-    applyWindowing();
-    container?.scrollTo?.({ top: container.scrollHeight, behavior: 'smooth' });
+    state.firstVisible = thresholdIndex();
+    renderWindow();
+    messages.at(-1)?.scrollIntoView({ block: 'end', behavior: 'smooth' });
+  }
+
+  function thresholdIndex() {
+    return Math.max(0, messages.length - Math.max(1, settings.maxVisible));
+  }
+
+  function resetWindow() {
+    for (const message of messages) setHidden(message, false);
+    for (const bubble of heightNodes) {
+      clearHeightLimit(bubble);
+      measuredHeights.delete(bubble);
+    }
+    messages = [];
+    state.firstVisible = 0;
+    state.prunedCount = 0;
+    clearPlaceholder();
+    uiBar?.remove();
   }
 
   // ─────────────────────────────────────────────────────────────────
@@ -469,36 +406,38 @@ import { getMessage } from './i18n';
   }
 
   function setupObserver() {
-    mainObserver?.disconnect();
-    mainObserver = new MutationObserver((mutations) => {
-      //detect if mutations are only created by the extension
-      for (const mutation of mutations) {
-        if (mutation.target.isGptBoost) return;
-        if (mutation.addedNodes.values().some((e) => e.isGptBoost)) return;
-        if (mutation.removedNodes.values().some((e) => e.isGptBoost)) return;
+    const structureSelector = MESSAGE_SELECTOR + ',main,[role="main"]';
+    const hostsThread = (node) =>
+      node instanceof Element &&
+      !node.isGptBoost &&
+      (node.matches(structureSelector) || Boolean(node.querySelector(structureSelector)));
+    const observer = new MutationObserver((records) => {
+      if (handleRouteChange()) {
+        scheduleApply('route change');
+        return;
       }
-      log('mutations', mutations);
-      if (!container?.isConnected) container = findContainer();
-      if (uiBar && !uiBar.isConnected) document.body.appendChild(uiBar);
-      scheduleApply('dom mutation');
+      if (!lastPath) return;
+      const changed = records.some((record) => {
+        const target = record.target;
+        if (!(target instanceof Element) || target.isGptBoost || target.closest(MESSAGE_SELECTOR)) return false;
+        return (
+          [...record.addedNodes].some(hostsThread) ||
+          [...record.removedNodes].some((node) => !prunedNodes.delete(node) && hostsThread(node))
+        );
+      });
+      if (changed) scheduleApply('message structure changed');
     });
-    mainObserver.observe(document.body, { childList: true, subtree: true });
-    log('setupObserver: attached');
+    observer.observe(document.body, { childList: true, subtree: true });
   }
 
   let lastPath = '';
   function handleRouteChange() {
-    const path = location.pathname + location.search;
-    if (path === lastPath) return;
+    const path = location.pathname.match(/\/(?:share|c)\/[^/]+(?=\/?$)/)?.[0] ?? '';
+    if (path === lastPath) return false;
     lastPath = path;
-    state.firstVisible = 0;
-    state.prunedCount = 0;
-    state.lastTotal = 0;
-    sentinelObserver?.disconnect();
-    sentinelObserver = null;
-    topSentinel?.remove();
-    topSentinel = null;
-    scheduleApply('route change');
+    resetWindow();
+    container = null;
+    return true;
   }
 
   // ─────────────────────────────────────────────────────────────────
@@ -508,21 +447,14 @@ import { getMessage } from './i18n';
     await loadSettings();
     watchSettings();
     setupObserver();
-    handleRouteChange();
+    document.addEventListener('click', onMessageClick);
     scheduleApply('init');
-
-    // SPA navigation
-    const origPush = history.pushState;
-    const origReplace = history.replaceState;
-    history.pushState = function () {
-      origPush.apply(this, arguments);
-      handleRouteChange();
+    const onNavigation = () => {
+      if (handleRouteChange()) scheduleApply('route change');
     };
-    history.replaceState = function () {
-      origReplace.apply(this, arguments);
-      handleRouteChange();
-    };
-    window.addEventListener('popstate', handleRouteChange);
+    window.navigation?.addEventListener('currententrychange', onNavigation);
+    window.addEventListener('popstate', onNavigation);
+    window.addEventListener('pageshow', onNavigation);
   }
 
   if (document.readyState === 'loading') {

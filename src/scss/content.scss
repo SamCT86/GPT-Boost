@@ -39,6 +39,15 @@
     &:hover {
       background: rgba(255, 255, 255, 0.25);
     }
+
+    &:disabled {
+      opacity: 0.55;
+      cursor: default;
+    }
+
+    &:focus-visible {
+      outline: 2px solid currentColor;
+    }
   }
 }
 
@@ -67,6 +76,7 @@
 
 .gpt-boost-hidden-placeholder {
   display: flex;
+  width: 100%;
   align-items: center;
   justify-content: center;
   color: #666;
@@ -79,14 +89,13 @@
   cursor: pointer;
 }
 
-.gpt-boost-sentinel {
-  height: 1px;
-  margin-top: 2px;
+.gpt-boost-turn-hidden {
+  display: none !important;
 }
 
 /* Message height limiting */
-[data-message-author-role].gpt-boost-collapsed {
-  max-height: 200px;
+.gpt-boost-collapsed {
+  max-height: var(--gpt-boost-message-max-height, 200px);
   overflow: hidden;
   position: relative;
   cursor: pointer;
@@ -109,7 +118,7 @@
   }
 }
 
-[data-message-author-role].gpt-boost-expanded {
+.gpt-boost-expanded {
   max-height: none;
   overflow: visible;
 }
